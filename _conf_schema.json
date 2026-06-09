@@ -40,6 +40,18 @@
         "default": 8,
         "hint": "抢劫成功后，最多能抢到的积分数。"
     },
+    "curfew_start": {
+        "description": "🌙 宵禁开始时间",
+        "type": "string",
+        "default": "02:00",
+        "hint": "限制抢劫的开始时间，格式如 02:00（务必带前导零）。"
+    },
+    "curfew_end": {
+        "description": "🌙 宵禁结束时间",
+        "type": "string",
+        "default": "06:00",
+        "hint": "限制抢劫的结束时间，格式如 06:00（务必带前导零）。"
+    },
     "intervene_fail_rate": {
         "description": "行侠仗义失败概率",
         "type": "float",
@@ -63,5 +75,59 @@
         "type": "int",
         "default": 10,
         "hint": "红名通缉犯被行侠仗义击败后，加倍扣除的积分数。"
+    },
+    "hr_auto_time": {
+        "description": "🐎 定时赛马时间",
+        "type": "string",
+        "default": "00:05",
+        "hint": "每天系统自动开启赛马的时间，格式如 00:05（务必带前导零）。留空则关闭自动赛马。"
+    },
+    "hr_source_group": {
+        "description": "🐎 赛马名册提取群号",
+        "type": "string",
+        "default": "",
+        "hint": "提取此群的积分前五名作为赛马。留空则提取当前发起活动的群。"
+    },
+    "hr_base_ticket": {
+        "description": "🐎 赛马最低押注(门票)",
+        "type": "int",
+        "default": 5,
+        "hint": "玩家最少需要花费多少积分才能下注。"
+    },
+    "hr_system_sponsor": {
+        "description": "🐎 系统初始赞助奖池",
+        "type": "int",
+        "default": 20,
+        "hint": "系统每次开局自动往奖池里扔的底金，让游戏更诱人。"
+    },
+    "hr_duration": {
+        "description": "🐎 下注等待时间(秒)",
+        "type": "int",
+        "default": 300,
+        "hint": "活动开始后留给群友下注的时间，默认300秒(5分钟)。"
+    },
+    "hr_max_players": {
+        "description": "🐎 赛马最大参与人数",
+        "type": "int",
+        "default": 50,
+        "hint": "达到此下注人数后，将提前锁盘拒绝下注。"
+    },
+    "hr_rich_curse": {
+        "description": "🐎 首富诅咒概率(0~1)",
+        "type": "float",
+        "default": 0.15,
+        "hint": "榜一大佬马失前蹄(必定跑倒数)的概率，0.15即15%。让大家不敢无脑押第一。"
+    },
+    "hr_red_name_buff": {
+        "description": "🐎 通缉犯狂暴倍率",
+        "type": "float",
+        "default": 1.5,
+        "hint": "身上带有【通缉犯】标签的赛马，夺冠权重提升的倍数。增加爆冷几率。"
+    },
+    "hr_tax_rate": {
+        "description": "🐎 赢家奖池抽水税率",
+        "type": "float",
+        "default": 0.05,
+        "hint": "赢家瓜分奖池时，系统回收的手续费比例，用于宏观控制防通胀。0.05即5%。"
     }
 }
