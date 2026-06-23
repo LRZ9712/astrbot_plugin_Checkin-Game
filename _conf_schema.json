@@ -15,6 +15,25 @@
         "default": [],
         "hint": "如果填写，插件【仅】在这些群运行，且直接忽略黑名单。"
     },
+    
+    
+    
+    "sign_in_points": {
+      "type": "int",
+      "title": "签到获得积分",
+      "description": "每次签到发放的积分",
+      "default": 10
+    },
+    "daily_rob_limit": {
+      "type": "int",
+      "title": "每日抢劫次数上限",
+      "description": "每人每天最多可抢劫多少次",
+      "default": 3
+    },
+    
+    
+    
+    
     "disabled_groups": {
         "description": "❌ 黑名单群号",
         "type": "list",
