@@ -7,6 +7,7 @@ import aiohttp
 import re
 from datetime import datetime, timedelta
 from io import BytesIO
+from pathlib import Path
 
 # 引入轻量级绘图库、裁剪工具和滤镜
 from PIL import Image as PILImage, ImageDraw, ImageFont, ImageOps, ImageFilter
@@ -21,9 +22,7 @@ from astrbot.api.all import *
 from astrbot.api.event import filter
 from astrbot.api.message_components import At, Plain
 
-# 🛡️ 核心修复 1：全局进程锁，防止热重载产生僵尸定时器导致发 5 遍消息
-global _AUTO_RACE_TASK
-_AUTO_RACE_TASK = None
+AUTO_RACE_TASK_ATTR = "_checkin_game_auto_race_task"
 
 @register("checkin_game", "Author", "群签到与经济抢劫插件(修复多开与数值版)", "1.9.3")
 class CheckinGamePlugin(Star):
@@ -33,6 +32,17 @@ class CheckinGamePlugin(Star):
         self.data_file = os.path.join(self.plugin_dir, "data.json")
         self.font_path = os.path.join(self.plugin_dir, "AlibabaPuHuiTi-2-65-Medium.ttf")
         
+        
+                # ========= 在 __init__ 里新增 =========
+        self.pending_duels = {}          # {group_id: {target_id: duel_info}}
+        self.duel_timeout_tasks = {}     # {(group_id, target_id): asyncio.Task}
+        
+        self.cache_dir = os.path.join("data", "plugins", "checkin_game", "cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
+        
+        
+        
         # 接收框架传入的最新的、唯一的面板配置
         self.config = config or {}
         self.users_data = self.load_data()
@@ -41,11 +51,308 @@ class CheckinGamePlugin(Star):
         self.active_red_packets = {}  
         self.last_events = {}         
 
-        # 启动定时赛马监控任务，清理旧的僵尸进程
-        global _AUTO_RACE_TASK
-        if _AUTO_RACE_TASK is not None and not _AUTO_RACE_TASK.done():
-            _AUTO_RACE_TASK.cancel()
-        _AUTO_RACE_TASK = asyncio.create_task(self._auto_horse_race_loop())
+        # 启动定时赛马监控任务，绑定到系统事件循环上清理旧进程
+        loop = asyncio.get_running_loop()
+        old_task = getattr(loop, AUTO_RACE_TASK_ATTR, None)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+
+        new_task = asyncio.create_task(self._auto_horse_race_loop(), name="checkin_game_auto_race")
+        setattr(loop, AUTO_RACE_TASK_ATTR, new_task)
+
+
+
+
+
+#分界线分界线分界线分界线分界线分界线分界线分界线分界线
+
+
+# ========= 放到类里：通用辅助方法 =========
+    def _duel_task_key(self, group_id: str, target_id: str):
+        return (str(group_id), str(target_id))
+    
+    async def _download_bytes(self, url: str, timeout: int = 15):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        return await resp.read()
+        except:
+            return None
+        return None
+    
+    async def _generate_meme_gif(self, api_url: str, qq_ids: list[str], file_prefix: str, texts: list[str] = None):
+        form = aiohttp.FormData()
+        
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
+            for idx, qq in enumerate(qq_ids):
+                avatar_url = f"https://q4.qlogo.cn/headimg_dl?dst_uin={qq}&spec=640"
+                async with session.get(avatar_url, timeout=15) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"下载头像失败: {qq}")
+                    img_bytes = await resp.read()
+                    form.add_field(
+                        "images",
+                        img_bytes,
+                        filename=f"avatar_{idx}.png",
+                        content_type="image/png"
+                    )
+            
+            # 👇 这里就是加上昵称的地方
+            if texts:
+                for text in texts:
+                    form.add_field("texts", text)
+
+            form.add_field("args", "{}")
+    
+            async with session.post(api_url, data=form, timeout=60) as resp:
+                if resp.status != 200:
+                    raise Exception(f"表情接口请求失败: HTTP {resp.status}")
+                result_bytes = await resp.read()
+    
+        ext = "gif"
+        out_path = os.path.join(self.cache_dir, f"{file_prefix}_{int(time.time())}.{ext}")
+        with open(out_path, "wb") as f:
+            f.write(result_bytes)
+        return out_path
+    
+    async def _duel_expire_after_40s(self, group_id: str, target_id: str):
+        await asyncio.sleep(40)
+    
+        group_id = str(group_id)
+        target_id = str(target_id)
+    
+        duel_map = self.pending_duels.get(group_id, {})
+        duel = duel_map.get(target_id)
+        if not duel:
+            return
+    
+        challenger_name = duel["challenger_name"]
+        target_name = duel["target_name"]
+        points = duel["points"]
+    
+        duel_map.pop(target_id, None)
+        self.duel_timeout_tasks.pop(self._duel_task_key(group_id, target_id), None)
+    
+        last_event = self.last_events.get(group_id)
+        if last_event:
+            try:
+                yield_msg = f"⚔️ 决斗已作废：{target_name} 在 40 秒内没有回复 /接受决斗。\n本次赌注 {points} 积分已取消，{challenger_name} 可以重新发起决斗。"
+                await last_event.send(yield_msg)
+            except:
+                pass
+    
+    
+    # ========= 新增：统一通缉犯判定 =========
+    def is_wanted(self, group_id: str, user_id: str, user_name: str = "") -> bool:
+        user = self.get_user(group_id, user_id, user_name or user_id)
+        return bool(user.get("is_red_name", False))
+    
+    
+    
+    
+    # ========= 新增命令：/决斗 =========
+    @filter.command("决斗")
+    async def duel(self, event: AstrMessageEvent):
+        group_id = str(event.message_obj.group_id)
+        self.last_events[group_id] = event
+    
+        if not group_id or group_id == "None":
+            yield event.plain_result("决斗只能在群聊中发起！")
+            return
+    
+        if not self.is_group_enabled(group_id):
+            return
+    
+        challenger_id = event.get_sender_id()
+        challenger_name = event.get_sender_name()
+    
+        target_id = None
+        target_name = "对方"
+    
+        for comp in event.message_obj.message:
+            if isinstance(comp, At):
+                target_id = str(comp.qq)
+                target_name = getattr(comp, "name", None) or "对方"
+                break
+    
+        if not target_id:
+            yield event.plain_result("格式错误：/决斗 5@小明\n请先输入赌注积分，并 @ 目标。")
+            return
+    
+        if target_id == challenger_id:
+            yield event.plain_result("你不能和自己决斗。")
+            return
+    
+        nums = []
+        for comp in event.message_obj.message:
+            if isinstance(comp, Plain):
+                nums.extend(re.findall(r'\d+', comp.text))
+    
+        if not nums:
+            yield event.plain_result("请填写赌注积分，例如：/决斗 5@小明")
+            return
+    
+        bet_points = int(nums[0])
+        if bet_points <= 0:
+            yield event.plain_result("赌注积分必须大于 0。")
+            return
+    
+        challenger_data = self.get_user(group_id, challenger_id, challenger_name)
+        target_data = self.get_user(group_id, target_id, target_name)
+    
+        if challenger_data["points"] < bet_points:
+            yield event.plain_result(f"你的积分不足，当前只有 {challenger_data['points']} 分。")
+            return
+    
+        if target_data["points"] < bet_points:
+            yield event.plain_result(f"对方积分不足，当前只有 {target_data['points']} 分，无法接受这场决斗。")
+            return
+    
+        if group_id not in self.pending_duels:
+            self.pending_duels[group_id] = {}
+    
+        if target_id in self.pending_duels[group_id]:
+            yield event.plain_result("该玩家当前已经有一场待接受的决斗了，请等这场结束或过期。")
+            return
+    
+        self.pending_duels[group_id][target_id] = {
+            "challenger_id": challenger_id,
+            "challenger_name": challenger_name,
+            "target_id": target_id,
+            "target_name": target_name,
+            "points": bet_points,
+            "created_at": time.time()
+        }
+    
+        task_key = self._duel_task_key(group_id, target_id)
+        old_task = self.duel_timeout_tasks.get(task_key)
+        if old_task and not old_task.done():
+            old_task.cancel()
+    
+        self.duel_timeout_tasks[task_key] = asyncio.create_task(
+            self._duel_expire_after_40s(group_id, target_id)
+        )
+    
+        yield event.plain_result(
+            f"⚔️ {challenger_name} 向 {target_name} 发起了决斗！\n"
+            f"赌注：{bet_points} 积分\n"
+            f"请 {target_name} 在 40 秒内发送 /接受决斗 ，超时自动作废。"
+        )
+    
+    
+    
+    
+    # ========= 新增命令：/接受决斗 =========
+    @filter.command("接受决斗")
+    async def accept_duel(self, event: AstrMessageEvent):
+        group_id = str(event.message_obj.group_id)
+        self.last_events[group_id] = event
+    
+        if not group_id or group_id == "None":
+            yield event.plain_result("决斗只能在群聊中进行！")
+            return
+    
+        if not self.is_group_enabled(group_id):
+            return
+    
+        target_id = event.get_sender_id()
+        target_name = event.get_sender_name()
+    
+        duel_map = self.pending_duels.get(group_id, {})
+        duel = duel_map.get(target_id)
+        if not duel:
+            yield event.plain_result("你当前没有待接受的决斗，或者这场决斗已经过期。")
+            return
+    
+        challenger_id = duel["challenger_id"]
+        challenger_name = duel["challenger_name"]
+        bet_points = duel["points"]
+    
+        challenger_data = self.get_user(group_id, challenger_id, challenger_name)
+        target_data = self.get_user(group_id, target_id, target_name)
+    
+        if challenger_data["points"] < bet_points:
+            duel_map.pop(target_id, None)
+            yield event.plain_result(f"决斗取消：发起人 {challenger_name} 当前积分不足 {bet_points}。")
+            return
+    
+        if target_data["points"] < bet_points:
+            duel_map.pop(target_id, None)
+            yield event.plain_result(f"决斗取消：你当前积分不足 {bet_points}。")
+            return
+    
+        task_key = self._duel_task_key(group_id, target_id)
+        old_task = self.duel_timeout_tasks.pop(task_key, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+    
+        duel_map.pop(target_id, None)
+    
+        challenger_win = random.choice([True, False])
+    
+        if challenger_win:
+            winner_id, winner_name = challenger_id, challenger_name
+            loser_id, loser_name = target_id, target_name
+            winner_data, loser_data = challenger_data, target_data
+        else:
+            winner_id, winner_name = target_id, target_name
+            loser_id, loser_name = challenger_id, challenger_name
+            winner_data, loser_data = target_data, challenger_data
+    
+        loser_data["points"] = max(0, loser_data["points"] - bet_points)
+        winner_data["points"] += bet_points
+        self.save_data()
+
+        # 1. 独立发出激战文本
+        await event.send(event.plain_result(f"⚔️ {challenger_name} 与 {target_name} 的决斗开始了！激战中..."))
+
+        # 2. 独立画图并发图
+        try:
+            gif_path = await self._generate_meme_gif(
+                "https://memers.tudouu.cn/api/memes/fencing/",
+                [challenger_id, target_id],
+                "duel"
+            )
+            # 恢复最原本发图的指令
+            await event.send(event.image_result(str(gif_path)))
+        except Exception as e:
+            # 哪怕有错，也只发在文本里告诉你
+            await event.send(event.plain_result(f"【图没画出来，原因：{str(e)[:50]}】"))
+
+        # 3. 停顿 3 秒
+        await asyncio.sleep(5)
+
+        # 4. 结尾结果用 yield 结束
+        msg = (
+            f"💥 决斗结束！\n"
+            f"胜者：{winner_name}\n"
+            f"败者：{loser_name}\n"
+            f"{loser_name} 输给了 {winner_name} {bet_points} 积分！"
+        )
+        yield event.plain_result(msg)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#分界线分界线分界线分界线分界线分界线分界线分界线分界线
 
     def get_cfg(self):
         """🛡️ 核心修复 2：完全抛弃本地 config 文件，只信任 AstrBot 网页控制台传入的数据"""
@@ -325,7 +632,7 @@ class CheckinGamePlugin(Star):
         canvas.save(out_path, format='JPEG', quality=90)
         return out_path
 
-    async def draw_profile_image(self, user_id, name, points, quote, rob_days):
+    async def draw_profile_image(self, user_id, name, points, quote, rob_days, is_red_name=False):
         avatar_url = f"https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
         avatar_bytes, bg_bytes = await asyncio.gather(self.fetch_image_bytes(avatar_url, timeout=3), self.fetch_random_bg())
         
@@ -369,6 +676,17 @@ class CheckinGamePlugin(Star):
                 with Pilmoji(canvas) as pilmoji: pilmoji.text((card_x + 40, card_y + 320), title_name, font=font_name, fill=(30, 30, 30))
             else: draw.text((card_x + 40, card_y + 320), title_name, font=font_name, fill=(30, 30, 30))
         except: draw.text((card_x + 40, card_y + 320), title_name, font=font_name, fill=(30, 30, 30))
+            
+        if is_red_name:
+            badge_x = card_x + 400
+            badge_y = card_y + 325
+            draw.rounded_rectangle(
+                [(badge_x, badge_y), (badge_x + 85, badge_y + 36)],
+                radius=10, fill=(220, 53, 69)
+            )
+            draw.text((badge_x + 10, badge_y + 8), "通缉犯", font=self.get_font(18), fill=(255, 255, 255))
+            
+            
             
         lv = (points // 10) + 1
         font_tag = self.get_font(16)
@@ -453,8 +771,8 @@ class CheckinGamePlugin(Star):
         footer_color, tips_color = (140, 130, 113), (160, 150, 130)
         
         draw.line([(40, y_offset + 10), (460, y_offset + 10)], fill=(220, 210, 190), width=2)
-        draw.text((40, y_offset + 25), "10积分   可兑换潇潇和你的设定关系", font=font_footer, fill=footer_color)
-        draw.text((40, y_offset + 55), "20积分   拉潇潇一次", font=font_footer, fill=footer_color)
+        draw.text((40, y_offset + 25), "15积分   可兑换潇潇或小面包和你的设定关系", font=font_footer, fill=footer_color)
+        draw.text((40, y_offset + 55), "30积分   拉潇潇一次", font=font_footer, fill=footer_color)
         draw.text((40, y_offset + 85), "* 仅限主群签到积分兑换", font=font_tips, fill=tips_color)
 
         out_path = os.path.abspath(os.path.join(self.plugin_dir, f"temp_leaderboard_{group_id}.jpg"))
@@ -483,7 +801,9 @@ class CheckinGamePlugin(Star):
             yield event.plain_result("今天已经签过到了哦！")
             return
             
-        user_data["points"] += 1
+        cfg = self.get_cfg()
+        sign_in_pts = cfg.get("sign_in_points", 10)
+        user_data["points"] += sign_in_pts
         user_data["last_checkin"] = today
         self.save_data()
         
@@ -503,8 +823,9 @@ class CheckinGamePlugin(Star):
         
         quote = await self.fetch_hitokoto()
         rob_days = user_data.get("rob_days_count", 0)
-        
-        img_path = await self.draw_profile_image(user_id, user_name, user_data["points"], quote, rob_days)
+        is_red = user_data.get("is_red_name", False)
+
+        img_path = await self.draw_profile_image(user_id, user_name, user_data["points"], quote, rob_days, is_red)
         yield event.image_result(str(img_path))
 
     # ================= 抢劫与行侠系统 =================
@@ -563,20 +884,23 @@ class CheckinGamePlugin(Star):
             return
 
         today_str = datetime.now().strftime("%Y-%m-%d")
-        if robber_data["last_rob_date"] == today_str:
-            yield event.plain_result("你今天已经作案过了，明天再来吧！")
-            return
 
-        if group_id in self.active_robberies:
-            yield event.plain_result("本群正有抢劫案发生，请稍后再试或前去 /行侠仗义！")
+        # 跨天时重置每日抢劫计数
+        if robber_data.get("last_rob_date") != today_str:
+            robber_data["last_rob_date"] = today_str
+            robber_data["rob_days_count"] = 0
+
+        limit = int(cfg.get("daily_rob_limit", 3))
+        if robber_data["rob_days_count"] >= limit:
+            yield event.plain_result(f"你今天已经作案 {limit} 次了，明天再来吧！")
             return
 
         robber_data["rob_days_count"] += 1
-        if robber_data["rob_days_count"] >= 5:
+        if robber_data["rob_days_count"] >= limit:
             robber_data["is_red_name"] = True
-            
+
         robber_data["last_rob_date"] = today_str
-        robber_data["last_decay_date"] = today_str 
+        robber_data["last_decay_date"] = today_str
         self.save_data()
 
         if random.random() < cfg.get("rob_fail_rate", 0.4):
@@ -590,6 +914,14 @@ class CheckinGamePlugin(Star):
             msg = f"⚠️ 警告！【{robber_name}】发起了抢劫！但目标太穷了，把兜翻底朝天也只有 {steal_points} 积分！\n⏳ 3 分钟内，输入 /行侠仗义 可阻止这场劫案！"
         else:
             msg = f"⚠️ 警告！【{robber_name}】正在抢劫目标！涉及积分：{steal_points}\n⏳ 3 分钟内，输入 /行侠仗义 可阻止这场劫案！"
+
+        task = asyncio.create_task(self.robbery_timeout(group_id, robber_id, target_id, steal_points))
+        self.active_robberies[group_id] = {
+            "robber_id": robber_id,
+            "target_id": target_id,
+            "points": steal_points,
+            "task": task
+        }
 
         yield event.plain_result(msg)
 
@@ -920,12 +1252,21 @@ class CheckinGamePlugin(Star):
         try: await event.send(event.plain_result(result_msg))
         except: pass
 
-        # 👑 赛后触发冠军机制，使用纯文本模拟命令
+        # 👑 赛后生成冠军动图并发送
         try:
-            winner_name = winner_horse[1]['name']
-            await event.send(event.plain_result(f"冠军 @{winner_name}"))
-        except: pass
-
+            winner_id = winner_horse[0]
+            winner_name = winner_horse[1]['name'][:8] # 拿到马主人的名字(防止太长截断前8个字)
+            
+            champion_gif_path = await self._generate_meme_gif(
+                "https://memers.tudouu.cn/api/memes/champion/",
+                [winner_id],
+                "champion",
+                texts=[winner_name]  # <--- 在这里把名字发给接口
+            )
+            # 单独发冠军图
+            await event.send(event.image_result(str(champion_gif_path)))
+        except Exception as e:
+            await event.send(event.plain_result(f"【冠军专属表情生成失败，原因：{str(e)[:50]}】"))
     # ================= 社交红包系统 =================
 
     @filter.command("发红包")
