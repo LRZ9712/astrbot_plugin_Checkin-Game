@@ -1,0 +1,10 @@
+name: astrbot_plugin_Checkin-Game
+display_name: 签到游戏
+short_desc: 一款用于 AstrBot 的签到游戏插件。
+desc: 提供签到互动玩法的 AstrBot 插件，支持自定义配置。
+author: LRZ9712 (蝎子赖赖)
+version: 1.0.0
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
